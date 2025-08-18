@@ -1,65 +1,68 @@
-import streamlit as st
 import os
-from langchain_groq import ChatGroq
-from langchain_community.document_loaders import WebBaseLoader
-from langchain.embeddings import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain_community.vectorstores import FAISS
-import time
-
-
+import streamlit as st
 from dotenv import load_dotenv
+
+from langchain_groq import ChatGroq
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 load_dotenv()
 
+groq_api_key = os.getenv("GROQ_API_KEY")
 
-## load the Groq API key
-groq_api_key=os.environ['GROQ_API_KEY']
+# Load documents from webpage
+loader = WebBaseLoader("https://en.wikipedia.org/wiki/India")
+docs = loader.load()
 
-if "vector" not in st.session_state:
-    st.session_state.embeddings=OllamaEmbeddings()
-    st.session_state.loader=WebBaseLoader("https://coovum.com/")
-    st.session_state.docs=st.session_state.loader.load()
+# Split docs into chunks for embedding
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+split_docs = text_splitter.split_documents(docs)
 
-    st.session_state.text_splitter=RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=2000)
-    st.session_state.final_documents=st.session_state.text_splitter.split_documents(st.session_state.docs[:50])
-    st.session_state.vectors=FAISS.from_documents(st.session_state.final_documents, st.session_state.embeddings)
+# Embeddings using local HuggingFace model (all-MiniLM-L6-v2)
+hf_embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
+# Build FAISS vectorstore from documents
+vectorstore = FAISS.from_documents(split_docs, hf_embedder)
 
-st.title("ChatGroq")
-llm=ChatGroq(groq_api_key=groq_api_key,
-             model_name="Gemma-7b-It")
+# Initialize Groq Chat model (ensure model name is correct and available)
+llm = ChatGroq(groq_api_key=groq_api_key, model_name="meta-llama/llama-guard-4-12b")
 
-prompt=ChatPromptTemplate.format_prompt(
-"""
-Answer the questions based on the provided context only
-Please provide the most accurate response based on the question
-<context>
+template = """
+Use only the following context to answer the question.
+If the answer is not contained in the context, say "I don't know."
+
+Context:
 {context}
-<context>
-Question:{input}
 
+Question: {question}
+Answer:
 """
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=vectorstore.as_retriever(),
+    chain_type_kwargs={"prompt": PromptTemplate.from_template(template)},
 )
 
-document_chain = create_stuff_documents_chain(llm, prompt)
-retriever = st.session_state.vector.as_retriever()
-retrieval_chain = create_retrieval_chain(retriever, document_chain)
+st.title("Groq Chat with Local Embeddings")
 
-prompt=st.text_input("Input you prompt here")
+query = st.text_input("Ask a question")
 
-if prompt:
-    start=time.process_time()
-    response=retrieval_chain.invoke({"input":prompt})
-    print("Response time :", time.process_time()-start)
-    st.write(response['answer'])
+if query:
+    retriever = vectorstore.as_retriever()
+    docs_for_query = retriever.get_relevant_documents(query)
 
+    st.write(f"Documents retrieved for query '{query}':")
+    for i, d in enumerate(docs_for_query):
+        st.write(f"Document chunk {i+1}:")
+        st.write(d.page_content[:500])  # limit output to first 500 chars
+        st.write("---")
 
-    # With a steamlit expander
-    with st.expander("Document Similarity Search"):
-        #  Find the relevant chunks
-        for i, doc in enumerate(response["context"]):
-            st.write(doc.page_content)
-            st.write("----------")
+    # Run the retrieval QA chain properly with 'query' input key
+    result = qa_chain.invoke({"query": query})
+    st.write("Answer:")
+    st.write(result['result'])
